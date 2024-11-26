@@ -1,0 +1,303 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# The purpose
+- One purpose is to design a boosting algorithm for multi-classification task 
+with fractional response.
+- Another purpose is to investigate the base_margin, base_score, outputmargin 
+option in xgboost R package
+
+Most boosting packages only accept  discrete response such as (1,0,0), (0,1,0).
+In the mixture model, we have fractional response  (0.2,0.3,0.5), (0.1,0,0.9).
+
+# Simulated data
+```{r simulated data}
+rm(list= ls())
+library(caret)
+library(nnet)
+library(rpart)
+library(partykit)
+library(xgboost)
+library(parallel)
+source("0_multiclass_bst.R")
+
+# train-validation-test ratio, 0.8:0.2:0.2
+nlearn = 10000
+ntest = 2000
+size0<-1 # when size0=10, Z1,Z2,Z3 is the fractional of success in 10 trials
+K=3
+sim_data<-function(n,size,seed){
+  # simulation of the multinomial distributed variables
+  set.seed(seed)
+  X1 = rnorm(n); X2 = rnorm(n); X3 = rnorm(n); X4 = rbinom(n,1,0.5)
+  F1 = tanh(X1^2); F2 = tanh(X2^2); F3 = tanh(X3^2*X4)
+  P<-FtoP(cbind(F1,F2,F3))
+  dat<- data.frame(X1,X2,X3,X4, F1,F2,F3, 
+                   P1=P[,1],P2=P[,2],P3=P[,3], Z1=NA,Z2=NA,Z3=NA)
+  for (i in 1:nrow(dat)){
+    dat[i,vname2("Z",K)]<- t(rmultinom(1, size=size, dat[i,vname2("P",K)]))/size
+  }
+  dat[,vname2("F",K)]<-PtoF(dat[,vname2("P",K)])
+  dat$Z<-dat$Z2+dat$Z3*2
+  dat
+}
+dat_learn<-sim_data(nlearn,size=size0,seed=1)
+dat_test<-sim_data(ntest,size=size0,seed=2)
+names(dat_learn)
+boxplot(dat_learn[,vname2("P",K)])
+boxplot(dat_test[,vname2("P",K)])
+summary(dat_learn[,vname2("Z",K)])
+table(dat_learn$Z)/nrow(dat_learn)
+table(dat_test$Z)/nrow(dat_test)
+```
+
+# Null model
+```{r null model}
+dat_learn$null_p1<-mean(dat_learn$Z1)
+dat_learn$null_p2<-mean(dat_learn$Z2)
+dat_learn$null_p3<-mean(dat_learn$Z3)
+dat_learn[,vname2("null_f",K)]<-FtoP(dat_learn[,vname2("null_p",K)])
+dat_test$null_p1<-mean(dat_learn$Z1)
+dat_test$null_p2<-mean(dat_learn$Z2)
+dat_test$null_p3<-mean(dat_learn$Z3)
+dat_test[,vname2("null_f",K)]<-FtoP(dat_test[,vname2("null_p",K)])
+
+(loss_t<-negLL(dat_test[,vname2("Z",K)],dat_test[,vname2("P",K)]))
+(loss_null<-negLL(dat_test[,vname2("Z",K)],dat_test[,vname2("null_p",K)],w=rep(1,nrow(dat_test))))
+negLL(dat_test[,vname2("Z",K)],dat_test[,vname2("null_p",K)],runif(nrow(dat_test)))
+```
+
+# Generalized linear model
+```{r}
+fit_glm<-nnet::multinom(as.matrix(dat_learn[,vname2("Z",K)]) ~ 
+                          X1 + X2 + X3 + X4, data=dat_learn, trace=T)
+dat_learn[,vname2("glm_p",K)]<-predict(fit_glm,newdata=dat_learn,type="probs")
+dat_learn[,vname2("glm_f",K)]<-PtoF(dat_learn[,vname2("glm_p",K)])
+dat_test[,vname2("glm_p",K)]<-predict(fit_glm,newdata=dat_test,type="probs")
+dat_test[,vname2("glm_f",K)]<-PtoF(dat_test[,vname2("glm_p",K)])
+
+(loss_glm<-negLL(dat_test[,vname2("Z",K)],dat_test[,vname2("glm_p",K)],rep(1,nrow(dat_test))))
+loss_null
+loss_t
+```
+
+# First boosting (user-defined boosting BST); BST accept the fractional response such as (0.2, 0.3, 0.5)
+```{r}
+valid_rows<-(nlearn*0.8+1):nlearn
+train_rows<-(1:nlearn)[-valid_rows]
+Xtrain <- dat_learn[train_rows, vname2("X",4)]
+Ytrain <- dat_learn[train_rows, vname2("Z",K)]
+Xval <- dat_learn[valid_rows, vname2("X",4)]
+Yval <- dat_learn[valid_rows, vname2("Z",K)]
+train_init <- dat_learn[train_rows, vname2("null_p",K)]
+valid_init <- dat_learn[valid_rows, vname2("null_p",K)]
+M <-50
+cp <- 0.001
+maxdepth <- 4
+lr = 0.1
+patience = 5
+t0<-Sys.time()
+# starting loss
+(train_loss0<-negLL(dat_learn[train_rows,vname2("Z",3)],dat_learn[train_rows,vname2("glm_p",3)]))
+(valid_loss0<-negLL(dat_learn[valid_rows,vname2("Z",3)],dat_learn[valid_rows,vname2("glm_p",3)]))
+
+bst_fit <- BST(Xtrain = Xtrain, Ytrain = Ytrain, Xval = Xval, Yval = Yval,
+               train_init = train_init, valid_init = valid_init, 
+               M = M, cp = cp, maxdepth = maxdepth, lr = lr, 
+               trace=T, patience = patience)
+difftime(t0,Sys.time())
+matplot(cbind(bst_fit$Train_loss,bst_fit$Valid_loss), type = "l")
+abline(v = which.min(bst_fit$Valid_loss), lty = 3)
+which.min(bst_fit$Valid_loss)
+
+# check negLL function, predict_BST and initial values
+negLL(Ytrain, 
+      predict_BST(X=Xtrain, BST_fit=bst_fit, init=train_init, type="response"))
+negLL(Yval,
+      predict_BST(X=Xval,BST_fit=bst_fit,init=valid_init,type="response"))
+
+# initial values must be added correctly
+negLL(Ytrain, predict_BST(X=Xtrain,BST_fit=bst_fit, init=dat_learn[train_rows,vname2("glm_p",3)],type="response"))
+negLL(Yval,predict_BST(X=Xval, BST_fit=bst_fit, init=dat_learn[valid_rows,vname2("glm_p",3)], type="response"))
+
+# test loss
+dat_test[,vname2("bst_p",K)]<- 
+  predict_BST(X=dat_test[,vname2("X",4)], BST_fit=bst_fit, 
+              init=dat_test[,vname2("null_p",K)], type="response")
+(loss_bst1<-negLL(dat_test[,vname2("Z",K)],dat_test[,vname2("bst_p",K)]))
+loss_glm
+loss_null
+loss_t
+
+# initial values are important
+negLL(dat_test[,vname2("Z",K)], predict_BST(X=dat_test[,vname2("X",4)], BST_fit=bst_fit, init=matrix(runif(K*nrow(dat_test)),nrow=nrow(dat_test),ncol=K), type="response"))
+```
+
+## connect several boosting (works well)
+```{r}
+train_init <- dat_learn[train_rows, vname2("null_p",K)]
+valid_init <- dat_learn[valid_rows, vname2("null_p",K)]
+test_init <- dat_test[, vname2("null_p",K)]
+
+for (m in 1:20){
+  bst_fit <- BST(Xtrain = Xtrain, Ytrain = Ytrain, Xval = Xval, Yval = Yval,
+                 train_init = train_init, valid_init = valid_init, 
+                 M = 1, cp = cp, maxdepth = maxdepth, lr = lr, 
+                 trace=T, patience = patience)
+  train_init<-predict_BST(X=Xtrain, BST_fit=bst_fit, init=train_init, type="response")
+  valid_init<-predict_BST(X=Xval, BST_fit=bst_fit, init=valid_init, type="response")
+  # test loss
+  dat_test[,vname2("bst_p",K)]<- 
+    predict_BST(X=dat_test[,vname2("X",4)], BST_fit=bst_fit, 
+                init=test_init, type="response")
+  test_init<-dat_test[,vname2("bst_p",K)]
+  print(negLL(dat_test[,vname2("Z",K)],dat_test[,vname2("bst_p",K)]))
+}
+# if train_init, test_init, test_init are not updated in each step, 
+# the algorithm will not converge.
+```
+
+# Second boosting (xgboost), does not work for fractional response, i.e., specifying size0=10  when simulating the data
+```{r}
+dlearn<-xgb.DMatrix(data=as.matrix(dat_learn[,vname2("X",4)]), 
+                       label=as.matrix(dat_learn$Z),
+                       base_margin=as.matrix(dat_learn[,vname2("null_f",K)]))
+dtest<-xgb.DMatrix(data=as.matrix(dat_test[,vname2("X",4)]),
+                      label=as.matrix(dat_test$Z),
+                      base_margin=as.matrix(dat_test[,vname2("null_f",K)]))
+dtrain <- xgboost::slice(dlearn, train_rows)
+dvalid <- xgboost::slice(dlearn, valid_rows)
+
+param<-list(max_depth=3, eta =0.1, objective="multi:softprob",
+            "num_class" = 3, eval_metric = "mlogloss")
+watchlist=list(train=dtrain, eval= dvalid)
+bst_fit2 <-xgb.train(param, dtrain, nrounds=100,verbose = 1,
+                      watchlist = watchlist, early_stopping_rounds = 5)
+
+# trace plot of loss
+matplot(bst_fit2$evaluation_log[,2:3],type="l",col=c("red","blue"))
+abline(h=c(train_loss0,valid_loss0),lty=2,col=c("red","blue"))
+
+# check the mlogloss
+negLL(dat_learn[train_rows,vname2("Z",K)], predict(bst_fit2, newdata = dtrain, reshape = T))
+negLL(dat_learn[valid_rows,vname2("Z",K)], predict(bst_fit2, newdata = dvalid, reshape = T))
+getinfo(dtrain,"base_margin")[1:10]
+head(dat_learn)
+
+# prediction on test data
+dat_test[,vname2("bst_p",K)]<-predict(bst_fit2, newdata = dtest, reshape = T)
+(loss_bst2<-negLL(dat_test[,vname2("Z",K)], dat_test[,vname2("bst_p",K)]))
+negLL(dat_test[,vname2("Z",K)], FtoP(predict(bst_fit2, newdata = dtest, reshape = T,outputmargin = T)))
+loss_bst1
+loss_glm
+loss_null
+loss_t
+
+# set other base_margin is not correct
+dtest<-xgb.DMatrix(data=as.matrix(dat_test[,vname2("X",4)]),
+                      label=as.matrix(dat_test$Z),
+                   base_margin=as.matrix(dat_test[,vname2("glm_f",K)]))
+negLL(dat_test[,vname2("Z",K)], predict(bst_fit2, newdata = dtest, reshape = T))
+```
+
+## connect several boosting by base_margin (does not work)
+```{r}
+learn_init_f<-dat_learn[,vname2("null_f",K)]
+test_init_f<-dat_test[,vname2("null_f",K)]
+
+for (m in 1:20){
+  dlearn<-xgb.DMatrix(data=as.matrix(dat_learn[,vname2("X",4)]), 
+                      label=as.matrix(dat_learn$Z),
+                      base_margin=as.matrix(learn_init_f))
+  dtest<-xgb.DMatrix(data=as.matrix(dat_test[,vname2("X",4)]),
+                     label=as.matrix(dat_test$Z),
+                     base_margin=as.matrix(test_init_f))
+  dtrain <- xgboost::slice(dlearn, train_rows)
+  dvalid <- xgboost::slice(dlearn, valid_rows)
+  
+  param<-list(max_depth=3, eta =0.1, objective="multi:softprob",
+              num_class = 3, eval_metric = "mlogloss")
+  watchlist=list(train=dtrain, eval= dvalid)
+  bst_fit2 <-xgb.train(param, dtrain, nrounds=1,verbose = 1,
+                       watchlist = watchlist, early_stopping_rounds = NULL)
+  learn_init_f<-predict(bst_fit2, newdata = dlearn, reshape = T, outputmargin = T)
+  test_init_f<-predict(bst_fit2, newdata = dtest, reshape = T, outputmargin = T)
+  dat_test[,vname2("bst_p",K)]<-predict(bst_fit2, newdata = dtest, reshape = T)
+  loss_bst2<-negLL(dat_test[,vname2("Z",K)], dat_test[,vname2("bst_p",K)])
+  print(c(loss_bst2,loss_bst1))
+  print(dat_test[1,vname2("rep_f",K)])
+}
+```
+
+## connect several boosting by base_score (does not work)
+```{r}
+dat_learn[,vname2("bst_p",K)]<-dat_learn[,vname2("null_p",K)]
+dlearn<-xgb.DMatrix(data=as.matrix(dat_learn[,vname2("X",4)]), 
+                      label=as.matrix(dat_learn$Z))
+dtest<-xgb.DMatrix(data=as.matrix(dat_test[,vname2("X",4)]),
+                     label=as.matrix(dat_test$Z))
+dtrain <- xgboost::slice(dlearn, train_rows)
+dvalid <- xgboost::slice(dlearn, valid_rows)
+base_score<-as.matrix(dat_learn[train_rows,vname2("bst_p",K)])
+base_score[1:2,]
+for (m in 1:20){
+  param<-list(max_depth=3, eta =0.1, objective="multi:softprob",
+              num_class = 3, eval_metric = "mlogloss", 
+              base_score = base_score)
+  watchlist=list(train=dtrain, eval= dvalid)
+  bst_fit2 <-xgb.train(param, dtrain, nrounds=1,verbose = 1,
+                       watchlist = watchlist, early_stopping_rounds = NULL)
+  base_score<-predict(bst_fit2, newdata = dtrain, reshape = T)
+  # prediction on test data
+  dat_test[,vname2("bst_p",K)]<-predict(bst_fit2, newdata = dtest, reshape = T)
+  loss_bst2<-negLL(dat_test[,vname2("Z",K)], dat_test[,vname2("bst_p",K)])
+  print(c(loss_bst2,loss_bst1))
+  print(base_score[1:2,])
+}
+# !! must set up the base_margin !!
+```
+
+# Investigate base_margin in xgboost prediction
+```{r}
+data(mtcars)
+y <- mtcars[, 11]
+m.train <- as.matrix(mtcars[, -11])
+
+d.train <- xgb.DMatrix(m.train, label = y,base_margin = log(rep(3, length(y))))
+bst_3 = xgb.train(d.train, params = list(objective = 'count:poisson'), nrounds = 25)
+pred_3 = predict(bst_3, d.train)
+head(pred_3)
+
+d.train <- xgb.DMatrix(m.train, label = y,base_margin = log(rep(1, length(y))))
+bst_1 = xgb.train(d.train, params = list(objective = 'count:poisson'), nrounds = 25)
+pred_1 = predict(bst_1, d.train)
+head(pred_1)
+head(pred_3)/head(pred_1)
+
+d.train <- xgb.DMatrix(m.train, label = y, base_margin = log(rep(2, length(y))))
+pred_2 = predict(bst_1, d.train)
+head(pred_2)/head(pred_1)
+d.train <- xgb.DMatrix(m.train, label = y, base_margin = log(rep(4, length(y))))
+pred_4 = predict(bst_1, d.train)
+head(pred_4)
+head(pred_4)/head(pred_1)
+exp(getinfo(d.train,"base_margin"))
+
+# setinfo does not work in the prediction
+setinfo(d.train,"base_margin",log(rep(5, length(y))) )
+pred_5 = predict(bst_1, d.train)
+head(pred_5)/head(pred_1)
+exp(getinfo(d.train,"base_margin"))
+
+# cannot set the base_margin in the predict function
+pred_5 = predict(bst_1, d.train, base_margin=log(rep(5, length(y))))
+head(pred_5)/head(pred_1)
+
+# only this works
+d.train <- xgb.DMatrix(m.train, label = y, base_margin = log(rep(5, length(y))))
+pred_5 = predict(bst_1, d.train)
+head(pred_5)/head(pred_1)
+```
+
