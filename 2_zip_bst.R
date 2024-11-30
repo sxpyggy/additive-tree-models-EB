@@ -1,3 +1,4 @@
+library("xgboost")
 ## negative likelihood
 neg_ll<-function(y,pi0,lambda,w=1){
   # the log-likelihood of zip model
