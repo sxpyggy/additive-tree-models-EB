@@ -16,6 +16,7 @@ dat$ClaimNb <- as.numeric(dat$ClaimNb)
 data (freMTPL2sev)
 sev <- freMTPL2sev
 sev$ClaimNb0 <- 1
+sev$IDpol<-as.numeric(sev$IDpol)
 dat0 <-
   aggregate (sev , by = list (IDpol = sev$IDpol), FUN = sum)[,c(1, 3:4)]
 names (dat0)[2] <- "ClaimTotal"
